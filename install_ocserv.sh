@@ -326,12 +326,24 @@ function configure_network() {
         # Enable IP masquerading
         iptables -t nat -A POSTROUTING -s 192.168.10.0/24 -o $PRIMARY_INTERFACE -j MASQUERADE
         
-        # Save the iptables rules
-        if [ -d /etc/iptables ]; then
+        # Install iptables-persistent if not available
+        if ! dpkg -l | grep -q iptables-persistent; then
+            echo_message "Installing iptables-persistent package..."
+            # Pre-answer the questions asked during installation
+            echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+            echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+            apt-get install -y iptables-persistent
+            
+            # Save the rules
             iptables-save > /etc/iptables/rules.v4
+            ip6tables-save > /etc/iptables/rules.v6
         else
-            echo_warning "Could not save iptables rules permanently. You may need to set them up again after reboot."
+            # Save the rules if iptables-persistent is already installed
+            iptables-save > /etc/iptables/rules.v4
+            ip6tables-save > /etc/iptables/rules.v6
         fi
+        
+        echo_message "iptables rules saved permanently"
     fi
     
     echo_message "Network configuration completed"
@@ -466,6 +478,217 @@ function modify_dns_settings() {
     echo_message "DNS settings updated and applied"
 }
 
+# Function to troubleshoot connectivity issues
+function troubleshoot_connectivity() {
+    echo_message "VPN Connectivity Troubleshooting"
+    echo ""
+    echo "Checking VPN server configuration..."
+    
+    # Check if the server is running
+    if ! systemctl is-active --quiet ocserv; then
+        echo_warning "OpenConnect server is not running!"
+        systemctl start ocserv
+        echo_message "Started OpenConnect server."
+    else
+        echo_message "OpenConnect server is running."
+    fi
+    
+    # Check routes
+    echo_message "Checking routing configuration..."
+    ROUTE_DEFAULT=$(grep -c "route = default" /etc/ocserv/ocserv.conf)
+    if [ $ROUTE_DEFAULT -eq 0 ]; then
+        echo_warning "Default route is missing in the configuration!"
+        echo_message "Adding default route..."
+        sed -i '/^no-route/i route = default' /etc/ocserv/ocserv.conf
+        CHANGES_MADE=true
+    else
+        echo_message "Default route is correctly configured."
+    fi
+    
+    # Check if IP forwarding is enabled
+    echo_message "Checking IP forwarding..."
+    IP_FORWARD=$(cat /proc/sys/net/ipv4/ip_forward)
+    if [ "$IP_FORWARD" != "1" ]; then
+        echo_warning "IP forwarding is not enabled!"
+        echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/60-custom.conf
+        sysctl -p /etc/sysctl.d/60-custom.conf
+        echo_message "IP forwarding has been enabled."
+        CHANGES_MADE=true
+    else
+        echo_message "IP forwarding is correctly enabled."
+    fi
+    
+    # Check NAT rules
+    echo_message "Checking NAT configuration..."
+    PRIMARY_INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
+    
+    if command -v ufw > /dev/null && ufw status | grep -q active; then
+        echo_message "Checking UFW masquerading rules..."
+        UFW_NAT=$(grep -c "POSTROUTING -s 192.168.10.0/24" /etc/ufw/before.rules)
+        if [ $UFW_NAT -eq 0 ]; then
+            echo_warning "UFW NAT rules are missing!"
+            sed -i '/^# End required lines/a\# NAT rules for OpenConnect VPN\n*nat\n:POSTROUTING ACCEPT [0:0]\n-A POSTROUTING -s 192.168.10.0/24 -o '"$PRIMARY_INTERFACE"' -j MASQUERADE\nCOMMIT' /etc/ufw/before.rules
+            ufw reload
+            echo_message "UFW NAT rules have been added and UFW has been reloaded."
+            CHANGES_MADE=true
+        else
+            echo_message "UFW NAT rules are correctly configured."
+        fi
+    else
+        echo_message "Checking iptables masquerading rules..."
+        IPTABLES_NAT=$(iptables -t nat -L POSTROUTING -v -n | grep -c "MASQUERADE.*192.168.10.0/24")
+        if [ $IPTABLES_NAT -eq 0 ]; then
+            echo_warning "iptables NAT rules are missing!"
+            iptables -t nat -A POSTROUTING -s 192.168.10.0/24 -o $PRIMARY_INTERFACE -j MASQUERADE
+            
+            # Make sure iptables-persistent is installed and save the rules
+            if ! dpkg -l | grep -q iptables-persistent; then
+                echo_message "Installing iptables-persistent package..."
+                echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+                echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+                apt-get install -y iptables-persistent
+            fi
+            
+            # Save the rules
+            iptables-save > /etc/iptables/rules.v4
+            
+            echo_message "iptables NAT rules have been added and saved."
+            CHANGES_MADE=true
+        else
+            echo_message "iptables NAT rules are correctly configured."
+        fi
+    fi
+    
+    # Check DNS settings
+    echo_message "Checking DNS configuration..."
+    DNS_COUNT=$(grep -c "dns = " /etc/ocserv/ocserv.conf)
+    if [ $DNS_COUNT -eq 0 ]; then
+        echo_warning "No DNS servers configured!"
+        sed -i '/^ipv4-netmask/a dns = 1.1.1.1\ndns = 1.0.0.1' /etc/ocserv/ocserv.conf
+        echo_message "Added Cloudflare DNS servers to configuration."
+        CHANGES_MADE=true
+    else
+        echo_message "DNS servers are configured: $(grep "dns = " /etc/ocserv/ocserv.conf | tr '\n' ' ')"
+        
+        # Ask if user wants to try different DNS servers
+        echo ""
+        echo "Would you like to try different DNS servers?"
+        echo "1. Keep current DNS settings"
+        echo "2. Use Cloudflare DNS (1.1.1.1, 1.0.0.1)"
+        echo "3. Use Google DNS (8.8.8.8, 8.8.4.4)"
+        echo "4. Use Quad9 DNS (9.9.9.9, 149.112.112.112)"
+        echo "5. Use OpenDNS (208.67.222.222, 208.67.220.220)"
+        
+        read -p "Select DNS option [1-5]: " DNS_CHOICE
+        
+        case $DNS_CHOICE in
+            1)
+                echo_message "Keeping current DNS settings."
+                ;;
+            2)
+                sed -i '/dns =.*/d' /etc/ocserv/ocserv.conf
+                sed -i '/^ipv4-netmask/a dns = 1.1.1.1\ndns = 1.0.0.1' /etc/ocserv/ocserv.conf
+                echo_message "Changed to Cloudflare DNS."
+                CHANGES_MADE=true
+                ;;
+            3)
+                sed -i '/dns =.*/d' /etc/ocserv/ocserv.conf
+                sed -i '/^ipv4-netmask/a dns = 8.8.8.8\ndns = 8.8.4.4' /etc/ocserv/ocserv.conf
+                echo_message "Changed to Google DNS."
+                CHANGES_MADE=true
+                ;;
+            4)
+                sed -i '/dns =.*/d' /etc/ocserv/ocserv.conf
+                sed -i '/^ipv4-netmask/a dns = 9.9.9.9\ndns = 149.112.112.112' /etc/ocserv/ocserv.conf
+                echo_message "Changed to Quad9 DNS."
+                CHANGES_MADE=true
+                ;;
+            5)
+                sed -i '/dns =.*/d' /etc/ocserv/ocserv.conf
+                sed -i '/^ipv4-netmask/a dns = 208.67.222.222\ndns = 208.67.220.220' /etc/ocserv/ocserv.conf
+                echo_message "Changed to OpenDNS."
+                CHANGES_MADE=true
+                ;;
+            *)
+                echo_warning "Invalid choice. Keeping current DNS settings."
+                ;;
+        esac
+    fi
+    
+    # Check MTU settings
+    echo_message "Checking MTU settings..."
+    MTU_DISCOVERY=$(grep -c "try-mtu-discovery = true" /etc/ocserv/ocserv.conf)
+    
+    echo "Would you like to adjust the MTU value? Some networks require a lower MTU."
+    echo "1. Keep current MTU settings"
+    echo "2. Set a lower MTU value (1400)"
+    echo "3. Set a very low MTU value (1300)"
+    echo "4. Set custom MTU value"
+    
+    read -p "Select MTU option [1-4]: " MTU_CHOICE
+    
+    case $MTU_CHOICE in
+        1)
+            echo_message "Keeping current MTU settings."
+            ;;
+        2)
+            if ! grep -q "^mtu " /etc/ocserv/ocserv.conf; then
+                sed -i '/^try-mtu-discovery/a mtu = 1400' /etc/ocserv/ocserv.conf
+            else
+                sed -i 's/^mtu = .*/mtu = 1400/' /etc/ocserv/ocserv.conf
+            fi
+            echo_message "MTU set to 1400."
+            CHANGES_MADE=true
+            ;;
+        3)
+            if ! grep -q "^mtu " /etc/ocserv/ocserv.conf; then
+                sed -i '/^try-mtu-discovery/a mtu = 1300' /etc/ocserv/ocserv.conf
+            else
+                sed -i 's/^mtu = .*/mtu = 1300/' /etc/ocserv/ocserv.conf
+            fi
+            echo_message "MTU set to 1300."
+            CHANGES_MADE=true
+            ;;
+        4)
+            read -p "Enter custom MTU value (recommended range 1200-1500): " CUSTOM_MTU
+            if [[ "$CUSTOM_MTU" =~ ^[0-9]+$ ]] && [ $CUSTOM_MTU -ge 1200 ] && [ $CUSTOM_MTU -le 1500 ]; then
+                if ! grep -q "^mtu " /etc/ocserv/ocserv.conf; then
+                    sed -i '/^try-mtu-discovery/a mtu = '$CUSTOM_MTU /etc/ocserv/ocserv.conf
+                else
+                    sed -i 's/^mtu = .*/mtu = '$CUSTOM_MTU'/' /etc/ocserv/ocserv.conf
+                fi
+                echo_message "MTU set to $CUSTOM_MTU."
+                CHANGES_MADE=true
+            else
+                echo_warning "Invalid MTU value. Must be between 1200-1500."
+            fi
+            ;;
+        *)
+            echo_warning "Invalid choice. Keeping current MTU settings."
+            ;;
+    esac
+    
+    # Apply changes if needed
+    if [ "$CHANGES_MADE" = true ]; then
+        echo_message "Applying changes and restarting OpenConnect server..."
+        systemctl restart ocserv
+        echo_message "OpenConnect server has been restarted with the new settings."
+    else
+        echo_message "No changes were needed to the configuration."
+    fi
+    
+    # Provide client-side troubleshooting advice
+    echo ""
+    echo_message "Client-side Troubleshooting Tips:"
+    echo "1. Make sure you're using the correct username and password"
+    echo "2. If using AnyConnect, try enabling 'Allow local LAN access' in the client settings"
+    echo "3. Check if your ISP or network blocks VPN connections"
+    echo "4. Try using a different VPN client (OpenConnect, AnyConnect, etc.)"
+    echo "5. If using macOS or iOS, check that you've trusted the server certificate"
+    echo ""
+    echo_message "Please disconnect and reconnect your VPN client to apply these changes."
+}
+
 # Function to install and configure the server
 function install_server() {
     install_dependencies
@@ -508,10 +731,11 @@ function main_menu() {
         echo "5. Show Server Configuration"
         echo "6. Modify DNS Settings"
         echo "7. Certificate Management"
-        echo "8. Exit"
+        echo "8. Troubleshoot Connectivity Issues"
+        echo "9. Exit"
         echo "==================================="
         
-        read -p "Enter your choice [1-8]: " CHOICE
+        read -p "Enter your choice [1-9]: " CHOICE
         
         case $CHOICE in
             1)
@@ -537,6 +761,9 @@ function main_menu() {
                 certificate_management
                 ;;
             8)
+                troubleshoot_connectivity
+                ;;
+            9)
                 echo_message "Exiting..."
                 exit 0
                 ;;
